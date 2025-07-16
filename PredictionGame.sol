@@ -1,0 +1,411 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
+import "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
+
+contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
+    uint256 public constant ROUND_DURATION = 60 seconds;
+    uint256 public constant BET_DURATION = 20 seconds;
+    uint256 public constant LOCK_DURATION = 20 seconds;
+    uint256 public constant SETTLE_DURATION = 20 seconds;
+    uint256 public constant PAYOUT_MULTIPLIER = 19;
+    uint256 public constant PAYOUT_DIVISOR = 10;
+    uint256 public constant DRAW_MULTIPLIER = 9;
+    uint256 public constant DRAW_DIVISOR = 10;
+    uint256 public constant MAX_BUFFER_SECONDS = 300;
+    address public constant pyth = 0x2880aB155794e7179c9eE2e38200202908C17B43;
+    bytes32 private constant priceId = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
+
+    IPyth public pythContract;
+    
+    address public operator = owner();
+    
+    uint256 public currentEpoch;
+    uint256 public currentPrice;
+    bool public genesisStarted;
+    bool public genesisLockOnce;
+    uint256 public minBetAmount = 0.1 ether;
+    uint256 public maxBetAmount = 10 ether;
+    uint256 public pendingWinnings = 0;
+
+    enum Position {
+        None,
+        Pump,
+        Dump
+    }
+
+    struct Round {
+        uint256 epoch;
+        uint256 startTimestamp;
+        uint256 lockTimestamp;
+        uint256 closeTimestamp;
+        uint256 lockPrice;
+        uint256 closePrice;
+        uint256 betVolume;
+        uint256 pumpAmount;
+        uint256 dumpAmount;
+        uint256 totalPayout;
+        Position winner;
+        bool oracleCalled;
+        bool rewardCalculated;
+        bool cancelled;
+    }
+
+    struct BetInfo {
+        Position position;
+        uint256 amount;
+        bool claimed;
+    }
+
+    mapping(uint256 => Round) public rounds;
+    mapping(address => uint256[]) public userRounds;
+    mapping(uint256 => mapping(address => BetInfo)) public userBetsInRound;
+    mapping(address => uint256) public userClaimableAmount;
+    mapping(uint256 => address[]) public usersInRound;
+
+    modifier onlyOperator() {
+        require(msg.sender == operator, "Not operator");
+        _;
+    }
+
+    modifier onlyOwnerOrOperator() {
+        require(msg.sender == owner() || msg.sender == operator, "Not owner or operator");
+        _;
+    }
+
+    modifier notContract() {
+        require(msg.sender == tx.origin, "Proxy not allowed");
+        address sender = msg.sender;
+        uint256 size;
+        assembly {
+            size := extcodesize(sender)
+        }
+        require(size == 0, "Contract not allowed"); 
+        _;
+    }
+
+    event ClaimedRewards(address indexed user, uint256 totalReward);
+    event FundsWithdrawn(uint256 amount);
+    event MinBetUpdated(uint256 minBet);
+    event MaxBetUpdated(uint256 maxBet);
+    event OperatorUpdated(address operator);
+    event StartRound(uint256 indexed epoch);
+    event LockRound(uint256 indexed epoch, uint256 lockPrice);
+    event EndRound(uint256 indexed epoch, uint256 closePrice);
+    event RoundCancelled(uint256 indexed epoch, string reason);
+    event BetPlaced(address indexed user, uint256 indexed epoch, uint256 amount, Position position);
+    event RewardsCalculated(
+        uint256 indexed epoch,
+        uint256 closePrice,
+        uint256 pumpAmount,
+        uint256 dumpAmount,
+        uint256 totalPayout
+    );
+
+    constructor() {
+        pythContract = IPyth(pyth);
+    }
+
+    function genesisStartRound() public onlyOperator whenNotPaused {
+        require(!genesisStarted, "Genesis already started");
+        currentEpoch = 1;
+        _startRound(currentEpoch);
+        genesisStarted = true;
+    }
+
+    function genesisLockRound(bytes[] calldata pythPriceUpdate) public payable onlyOperator whenNotPaused {
+        require(genesisStarted, "Genesis not started");
+        require(!genesisLockOnce, "Genesis lock already done");
+        require(roundLockable(currentEpoch), "Round not lockable");
+        
+        uint256 price = updateAndGetPrice(pythPriceUpdate);
+        currentPrice = price;
+        
+        _safeLockRound(currentEpoch, price);
+        currentEpoch = currentEpoch + 1;
+        _startRound(currentEpoch);
+        genesisLockOnce = true;
+    }
+
+    function executeRound(bytes[] calldata pythPriceUpdate) public payable onlyOperator whenNotPaused {
+        require(
+            genesisStarted && genesisLockOnce,
+            "Can only run after genesisStartRound and genesisLockRound is triggered"
+        );
+        
+        uint256 price = updateAndGetPrice(pythPriceUpdate);
+        currentPrice = price;
+        
+        _safeLockRound(currentEpoch, price);
+        _safeEndRound(currentEpoch - 1, price);
+        _calculateRewards(currentEpoch - 1);
+        
+        currentEpoch = currentEpoch + 1;
+        _safeStartRound(currentEpoch);
+    }
+
+    function _safeStartRound(uint256 epoch) internal {
+        require(genesisStarted, "Can only run after genesisStartRound is triggered");
+        require(rounds[epoch - 2].closeTimestamp != 0, "Can only start round after round n-2 has ended");
+        require(
+            block.timestamp >= rounds[epoch - 2].closeTimestamp,
+            "Can only start new round after round n-2 closeTimestamp"
+        );
+        _startRound(epoch);
+    }
+
+    function _safeLockRound(uint256 epoch, uint256 price) internal {
+        require(rounds[epoch].startTimestamp != 0, "Can only lock round after round has started");
+        require(block.timestamp >= rounds[epoch].lockTimestamp, "Can only lock round after lockTimestamp");
+        require(
+            block.timestamp <= rounds[epoch].lockTimestamp + MAX_BUFFER_SECONDS,
+            "Can only lock round within bufferSeconds"
+        );
+        
+        Round storage round = rounds[epoch];
+        round.closeTimestamp = block.timestamp + LOCK_DURATION + SETTLE_DURATION;
+        round.lockPrice = price;
+        round.oracleCalled = true;
+        
+        emit LockRound(epoch, round.lockPrice);
+    }
+
+    function _safeEndRound(uint256 epoch, uint256 price) internal {
+        require(rounds[epoch].lockTimestamp != 0, "Can only end round after round has locked");
+        require(block.timestamp >= rounds[epoch].closeTimestamp, "Can only end round after closeTimestamp");
+        require(
+            block.timestamp <= rounds[epoch].closeTimestamp + MAX_BUFFER_SECONDS,
+            "Can only end round within bufferSeconds"
+        );
+        
+        Round storage round = rounds[epoch];
+        round.closePrice = price;
+        
+        emit EndRound(epoch, round.closePrice);
+    }
+
+    function _startRound(uint256 epoch) internal {
+        Round storage round = rounds[epoch];
+        round.epoch = epoch;
+        round.startTimestamp = block.timestamp;
+        round.lockTimestamp = block.timestamp + BET_DURATION;
+        round.closeTimestamp = block.timestamp + BET_DURATION + LOCK_DURATION + SETTLE_DURATION;
+        
+        emit StartRound(epoch);
+    }
+
+    function _calculateRewards(uint256 epoch) internal {
+        require(rounds[epoch].oracleCalled, "Oracle not called");
+        require(!rounds[epoch].rewardCalculated, "Rewards already calculated");
+        
+        Round storage round = rounds[epoch];
+        address[] memory users = usersInRound[epoch];
+        
+        if (round.lockPrice == round.closePrice) {
+            round.winner = Position.None;
+            round.cancelled = true;
+            
+            for (uint256 i = 0; i < users.length; i++) {
+                address user = users[i];
+                BetInfo storage bet = userBetsInRound[epoch][user];
+                if (bet.amount > 0 && !bet.claimed) {
+                    uint256 reward = calculateDrawPayout(bet.amount);
+                    userClaimableAmount[user] += reward;
+                    round.totalPayout += reward;
+                    bet.claimed = true;
+                }
+            }
+            
+            emit RoundCancelled(epoch, "Draw");
+        } else {
+            round.winner = round.closePrice > round.lockPrice ? Position.Pump : Position.Dump;
+            
+            for (uint256 i = 0; i < users.length; i++) {
+                address user = users[i];
+                BetInfo storage bet = userBetsInRound[epoch][user];
+                if (bet.amount > 0 && !bet.claimed && bet.position == round.winner) {
+                    uint256 reward = calculatePotentialPayout(bet.amount);
+                    userClaimableAmount[user] += reward;
+                    round.totalPayout += reward;
+                    bet.claimed = true;
+                }
+            }
+            
+            emit RewardsCalculated(
+                epoch,
+                round.closePrice,
+                round.pumpAmount,
+                round.dumpAmount,
+                round.totalPayout
+            );
+        }
+        
+        round.rewardCalculated = true;
+    }
+
+    function updatePrice(bytes[] memory pythPriceUpdate) public payable {
+        uint256 updateFee = pythContract.getUpdateFee(pythPriceUpdate);
+        pythContract.updatePriceFeeds{value: updateFee}(pythPriceUpdate);
+    }
+
+    function updateAndGetPrice(bytes[] memory pythPriceUpdate) public payable returns (uint256) {
+        updatePrice(pythPriceUpdate);
+        PythStructs.Price memory price = pythContract.getPriceNoOlderThan(priceId, 60);
+        int256 fullPrice = int256(price.price);
+        require(fullPrice > 0, "Negative price");
+        return uint256(fullPrice);
+    }
+
+    function betPump() external payable nonReentrant whenNotPaused notContract {
+        _placeBet(Position.Pump);
+    }
+
+    function betDump() external payable nonReentrant whenNotPaused notContract {
+        _placeBet(Position.Dump);
+    }
+
+    function _placeBet(Position position) internal {
+        require(bettable(currentEpoch), "Round not bettable");
+        require(position == Position.Pump || position == Position.Dump, "Invalid position");
+
+        BetInfo storage bet = userBetsInRound[currentEpoch][msg.sender];
+        require(bet.amount == 0, "Already bet");
+        require(msg.value >= minBetAmount, "Below min bet");
+        require(msg.value <= maxBetAmount, "Above max bet");
+
+        bet.position = position;
+        bet.amount = msg.value;
+        userRounds[msg.sender].push(currentEpoch);
+        usersInRound[currentEpoch].push(msg.sender);
+
+        Round storage round = rounds[currentEpoch];
+        round.betVolume += msg.value;
+
+        if (position == Position.Pump) {
+            round.pumpAmount += msg.value;
+        } else {
+            round.dumpAmount += msg.value;
+        }
+
+        emit BetPlaced(msg.sender, currentEpoch, msg.value, position);
+    }
+
+    function claim() external nonReentrant notContract {
+        uint256 totalReward = userClaimableAmount[msg.sender];
+        require(totalReward > 0, "Nothing to claim");
+        require(address(this).balance >= totalReward, "Insufficient Contract Balance");
+        (bool ok, ) = payable(msg.sender).call{value: totalReward}("");
+        require(ok, "Transfer Fail");
+        userClaimableAmount[msg.sender] = 0;
+        emit ClaimedRewards(msg.sender, totalReward);
+    }
+
+    function cancelRound(uint256 epoch) external onlyOwnerOrOperator {
+        Round storage round = rounds[epoch];
+        require(!round.rewardCalculated && !round.cancelled, "Round finished");
+        require(block.timestamp > round.closeTimestamp + MAX_BUFFER_SECONDS, "Buffer time not passed");
+
+        round.cancelled = true;
+        emit RoundCancelled(epoch, "Timeout");
+    }
+
+    function withdraw(uint256 amount) external onlyOwner nonReentrant {
+        require(address(this).balance >= amount, "Withdraw amt > balance");
+        (bool ok, ) = payable(owner()).call{value: amount}("");
+        require(ok, "Transfer fail");
+        emit FundsWithdrawn(amount);
+    }
+
+    function calculatePotentialPayout(uint256 betAmount) public pure returns (uint256) {
+        return betAmount * PAYOUT_MULTIPLIER / PAYOUT_DIVISOR;
+    }
+
+    function calculateDrawPayout(uint256 betAmount) public pure returns (uint256) {
+        return betAmount * DRAW_MULTIPLIER / DRAW_DIVISOR;
+    }
+
+    function bettable(uint256 epoch) public view returns (bool) {
+        return
+            rounds[epoch].startTimestamp != 0 &&
+            rounds[epoch].lockTimestamp != 0 &&
+            block.timestamp > rounds[epoch].startTimestamp &&
+            block.timestamp < rounds[epoch].lockTimestamp;
+    }
+
+    function roundLockable(uint256 epoch) public view returns (bool) {
+        return
+            rounds[epoch].startTimestamp != 0 &&
+            rounds[epoch].lockTimestamp != 0 &&
+            block.timestamp >= rounds[epoch].lockTimestamp &&
+            block.timestamp <= rounds[epoch].lockTimestamp + MAX_BUFFER_SECONDS &&
+            !rounds[epoch].oracleCalled;
+    }
+
+    function roundSettlable(uint256 epoch) public view returns (bool) {
+        return
+            rounds[epoch].oracleCalled &&
+            rounds[epoch].closeTimestamp != 0 &&
+            block.timestamp >= rounds[epoch].closeTimestamp &&
+            block.timestamp <= rounds[epoch].closeTimestamp + MAX_BUFFER_SECONDS;
+    }
+
+    function setOperator(address _operator) external onlyOwner {
+        require(_operator != address(0), "Zero address");
+        operator = _operator;
+        emit OperatorUpdated(_operator);
+    }
+
+    function setMinBet(uint256 _minBetAmount) external onlyOwner {
+        require(_minBetAmount > 0, "Must be > 0");
+        minBetAmount = _minBetAmount;
+        emit MinBetUpdated(_minBetAmount);
+    }
+
+    function setMaxBet(uint256 _maxBetAmount) external onlyOwner {
+        require(_maxBetAmount > minBetAmount, "Must be > min");
+        maxBetAmount = _maxBetAmount;
+        emit MaxBetUpdated(_maxBetAmount);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function getCurrentRoundInfo() external view returns (
+        uint256 epoch,
+        uint256 startTimestamp,
+        uint256 lockTimestamp,
+        uint256 closeTimestamp,
+        uint256 lockPrice,
+        uint256 closePrice,
+        uint256 pumpAmount,
+        uint256 dumpAmount,
+        bool oracleCalled,
+        bool rewardCalculated
+    ) {
+        Round storage round = rounds[currentEpoch];
+        return (
+            round.epoch,
+            round.startTimestamp,
+            round.lockTimestamp,
+            round.closeTimestamp,
+            round.lockPrice,
+            round.closePrice,
+            round.pumpAmount,
+            round.dumpAmount,
+            round.oracleCalled,
+            round.rewardCalculated
+        );
+    }
+
+    receive() external payable onlyOwnerOrOperator {}
+    fallback() external payable {}
+}
