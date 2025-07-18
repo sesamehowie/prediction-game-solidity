@@ -8,20 +8,18 @@ import "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
 import "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 
 contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
-    uint256 public constant BET_DURATION = 20 seconds;
-    uint256 public constant LOCK_DURATION = 20 seconds;
-    uint256 public constant SETTLE_DURATION = 20 seconds;
+    IPyth public pythContract;
+    bytes32 private constant priceId = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
+    address public constant pyth = 0x2880aB155794e7179c9eE2e38200202908C17B43;
+    address public operator;
+    uint256 public constant ROUND_STAGE_DURATION = 20;
     uint256 public constant PAYOUT_MULTIPLIER = 19;
     uint256 public constant PAYOUT_DIVISOR = 10;
     uint256 public constant MAX_BUFFER_SECONDS = 300;
-    address public constant pyth = 0x2880aB155794e7179c9eE2e38200202908C17B43;
-    bytes32 private constant priceId = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
-    IPyth public pythContract;
-    address public operator;
-    uint256 public currentRoundId;
-    uint256 public currentPrice;
     uint256 public minBetAmount = 0.1 ether;
     uint256 public maxBetAmount = 10 ether;
+    uint256 public currentRoundId;
+    uint256 public currentPrice;
     uint8 public genesisStarted = 0;
     uint8 public genesisLocked = 0;
 
@@ -168,7 +166,7 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         );
         
         Round storage round = rounds[roundId];
-        round.closeTimestamp = block.timestamp + LOCK_DURATION + SETTLE_DURATION;
+        round.closeTimestamp = block.timestamp + (ROUND_STAGE_DURATION);
         round.lockPrice = price;
         round.oracleCalled = true;
         
@@ -193,8 +191,10 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         Round storage round = rounds[roundId];
         round.roundId = roundId;
         round.startTimestamp = block.timestamp;
-        round.lockTimestamp = block.timestamp + BET_DURATION;
-        round.closeTimestamp = block.timestamp + BET_DURATION + LOCK_DURATION + SETTLE_DURATION;
+
+        uint256 prevCloseTimestamp = roundId > 1 ? rounds[roundId - 1].closeTimestamp : block.timestamp;
+        round.lockTimestamp = prevCloseTimestamp;
+        round.closeTimestamp = prevCloseTimestamp + ROUND_STAGE_DURATION;
         
         emit StartRound(roundId);
     }
@@ -306,11 +306,10 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
             round.rewardsCalculated = true;
 
             Round storage currentRound = rounds[currentRoundId];
-
             if (currentRound.startTimestamp != 0 && !currentRound.oracleCalled) {
                 currentRound.startTimestamp = block.timestamp;
-                currentRound.lockTimestamp = block.timestamp + BET_DURATION;
-                currentRound.closeTimestamp = block.timestamp + BET_DURATION + LOCK_DURATION + SETTLE_DURATION;
+                currentRound.lockTimestamp = block.timestamp;
+                currentRound.closeTimestamp = block.timestamp + ROUND_STAGE_DURATION;
                 emit StartRound(currentRoundId);
             }
         }
@@ -332,8 +331,8 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
             Round storage prevRound = rounds[currentRoundId - 1];
             if (!prevRound.rewardsCalculated) {
                 prevRound.closeTimestamp = block.timestamp;
-                prevRound.lockTimestamp = block.timestamp - SETTLE_DURATION;
-                prevRound.startTimestamp = prevRound.lockTimestamp - LOCK_DURATION;
+                prevRound.lockTimestamp = block.timestamp - ROUND_STAGE_DURATION;
+                prevRound.startTimestamp = block.timestamp - (ROUND_STAGE_DURATION * 2);
                 if (prevRound.roundCancelled) {
                     prevRound.rewardsCalculated = true;
                 } else {
