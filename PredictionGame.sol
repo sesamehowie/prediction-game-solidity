@@ -394,8 +394,7 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
                 if (!bet.claimed) {
                     uint256 winAmount = round.winner == Position.Pump ? bet.pumpAmount : bet.dumpAmount;
                     if (winAmount > 0) {
-                        uint256 reward = (winAmount * (totalLosingAmount * PAYOUT_MULTIPLIER / PAYOUT_DIVISOR)) / totalWinningAmount;
-                        reward += winAmount;
+                        uint256 reward = winAmount * PAYOUT_MULTIPLIER / PAYOUT_DIVISOR;
                         userClaimableAmount[user] += reward;
                         userClaimableRounds[user][roundId] = reward;
                         round.totalPayout += reward;
