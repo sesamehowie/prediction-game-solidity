@@ -13,28 +13,23 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
     uint256 public constant SETTLE_DURATION = 20 seconds;
     uint256 public constant PAYOUT_MULTIPLIER = 19;
     uint256 public constant PAYOUT_DIVISOR = 10;
-    uint256 public constant DRAW_MULTIPLIER = 9;
-    uint256 public constant DRAW_DIVISOR = 10;
     uint256 public constant MAX_BUFFER_SECONDS = 300;
     address public constant pyth = 0x2880aB155794e7179c9eE2e38200202908C17B43;
     bytes32 private constant priceId = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
-
     IPyth public pythContract;
-    
-    address public operator = owner();
-    
+    address public operator;
     uint256 public currentRoundId;
     uint256 public currentPrice;
     uint256 public minBetAmount = 0.1 ether;
     uint256 public maxBetAmount = 10 ether;
-    uint8 public genesisStarted;
-    uint8 public genesisLockOnce;
+    uint8 public genesisStarted = 0;
+    uint8 public genesisLocked = 0;
 
     enum Position {
         None,
         Pump,
         Dump
-    }
+    } 
 
     struct Round {
         uint256 roundId;
@@ -47,15 +42,15 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         uint256 pumpAmount;
         uint256 dumpAmount;
         uint256 totalPayout;
-        Position winner;
         bool oracleCalled;
-        bool rewardCalculated;
-        bool cancelled;
+        bool rewardsCalculated;
+        bool roundCancelled;
+        Position winner;
     }
 
     struct BetInfo {
-        Position position;
-        uint256 amount;
+        uint256 pumpAmount;
+        uint256 dumpAmount;
         bool claimed;
     }
 
@@ -93,8 +88,8 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
     event MaxBetUpdated(uint256 maxBet);
     event OperatorUpdated(address operator);
     event StartRound(uint256 indexed roundId);
-    event LockRound(uint256 indexed roundId, uint256 lockPrice);
-    event EndRound(uint256 indexed roundId, uint256 closePrice);
+    event LockRound(uint256 indexed roundId, uint256 lockPrice, uint256 betVolume);
+    event EndRound(uint256 indexed roundId, uint256 closePrice, uint256 pumpAmount, uint256 dumpAmount, uint256 betVolume, uint256 totalPayout, Position winnerPosition);
     event RoundCancelled(uint256 indexed roundId, string reason);
     event BetPlaced(address indexed user, uint256 indexed roundId, uint256 amount, Position position);
     event RewardsCalculated(
@@ -106,10 +101,10 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         Position position
     );
     event PlayerRefunded(address indexed player, uint256 indexed roundId, uint256 amount);
-    event ArrayItemRemovedAtIndex(uint index);
     event ClaimedRewardsInRound(address indexed user, uint256 indexed roundId, uint256 amount);
 
-    constructor() {
+    constructor(address _operator) {
+        operator = _operator;
         pythContract = IPyth(pyth);
     }
 
@@ -122,7 +117,7 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
 
     function genesisLockRound(bytes[] calldata pythPriceUpdate) public payable onlyOperator whenNotPaused {
         require(genesisStarted == 1, "Genesis not started");
-        require(genesisLockOnce == 0, "Genesis lock already done");
+        require(genesisLocked == 0, "Genesis lock already done");
         require(roundLockable(currentRoundId), "Round not lockable");
         
         uint256 price = updateAndGetPrice(pythPriceUpdate);
@@ -131,12 +126,12 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         _safeLockRound(currentRoundId, price);
         currentRoundId = currentRoundId + 1;
         _startRound(currentRoundId);
-        genesisLockOnce = 1;
+        genesisLocked = 1;
     }
 
     function executeRound(bytes[] calldata pythPriceUpdate) public payable onlyOperator whenNotPaused {
         require(
-            genesisStarted == 1 && genesisLockOnce == 1,
+            genesisStarted == 1 && genesisLocked == 1,
             "Can only run after genesisStartRound and genesisLockRound is triggered"
         );
         
@@ -174,7 +169,7 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         round.lockPrice = price;
         round.oracleCalled = true;
         
-        emit LockRound(roundId, round.lockPrice);
+        emit LockRound(roundId, round.lockPrice, round.betVolume);
     }
 
     function _safeEndRound(uint256 roundId, uint256 price) internal {
@@ -188,7 +183,7 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         Round storage round = rounds[roundId];
         round.closePrice = price;
         
-        emit EndRound(roundId, round.closePrice);
+        emit EndRound(roundId, round.closePrice, round.pumpAmount, round.dumpAmount, round.betVolume, round.totalPayout, round.winner);
     }
 
     function _startRound(uint256 roundId) internal {
@@ -209,7 +204,7 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
 
     function updateAndGetPrice(bytes[] memory pythPriceUpdate) public payable returns (uint256) {
         updatePrice(pythPriceUpdate);
-        PythStructs.Price memory price = pythContract.getPriceNoOlderThan(priceId, 60);
+        PythStructs.Price memory price = pythContract.getPriceNoOlderThan(priceId, 20);
         int256 fullPrice = int256(price.price);
         require(fullPrice > 0, "Negative price");
         return uint256(fullPrice);
@@ -228,18 +223,25 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         require(position == Position.Pump || position == Position.Dump, "Invalid position");
 
         BetInfo storage bet = userBetsInRound[currentRoundId][msg.sender];
-        require(bet.amount == 0, "Already bet");
+        uint256 currentTotal = bet.pumpAmount + bet.dumpAmount;
+        uint256 newTotal = currentTotal + msg.value;
+        
         require(msg.value >= minBetAmount, "Below min bet");
-        require(msg.value <= maxBetAmount, "Above max bet");
+        require(newTotal <= maxBetAmount, "Exceeds max bet per round");
 
-        bet.position = position;
-        bet.amount = msg.value;
-        userRounds[msg.sender].push(currentRoundId);
-        usersInRound[currentRoundId].push(msg.sender);
+        if (currentTotal == 0) {
+            userRounds[msg.sender].push(currentRoundId);
+            usersInRound[currentRoundId].push(msg.sender);
+        }
 
-        Round memory round = rounds[currentRoundId];
+        if (position == Position.Pump) {
+            bet.pumpAmount += msg.value;
+        } else {
+            bet.dumpAmount += msg.value;
+        }
+
+        Round storage round = rounds[currentRoundId];
         round.betVolume += msg.value;
-
         if (position == Position.Pump) {
             round.pumpAmount += msg.value;
         } else {
@@ -250,22 +252,24 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
     }
 
     function claimRewardInRound(uint256 roundId) external nonReentrant notContract {
-        uint256 totalClaimableAmount = userClaimableAmount[msg.sender];
+        address user = msg.sender;
+        uint256 totalClaimableAmount = userClaimableAmount[user];
         require(totalClaimableAmount > 0, "No claimable amt");
-        uint256 claimableAmtInRound = userClaimableRounds[msg.sender][roundId];
+        uint256 claimableAmtInRound = userClaimableRounds[user][roundId];
         require(claimableAmtInRound > 0, "Round not claimable"); 
-        require(address(this).balance > claimableAmtInRound, "Insufficient Contract balance");
-        userClaimableAmount[msg.sender] = totalClaimableAmount - claimableAmtInRound;
-        userClaimableRounds[msg.sender][roundId] = 0;
-        emit ClaimedRewardsInRound(msg.sender, roundId, claimableAmtInRound); 
-        (bool ok, ) = payable(msg.sender).call{value: claimableAmtInRound}("");
+        userClaimableAmount[user] = totalClaimableAmount - claimableAmtInRound;
+        userClaimableRounds[user][roundId] = 0;
+        userBetsInRound[roundId][user].claimed = true;
+        require(address(this).balance >= claimableAmtInRound, "Insufficient Contract balance");
+        emit ClaimedRewardsInRound(user, roundId, claimableAmtInRound); 
+        (bool ok, ) = payable(user).call{value: claimableAmtInRound}("");
         require(ok, "Transfer Fail");
     }
 
     function claimAllRewards() external nonReentrant notContract {
         uint256 totalReward = userClaimableAmount[msg.sender];
         require(totalReward > 0, "Nothing to claim");
-        require(address(this).balance > totalReward, "Insufficient Contract Balance");
+        require(address(this).balance >= totalReward, "Insufficient Contract Balance");
         userClaimableAmount[msg.sender] = 0;
         emit ClaimedRewards(msg.sender, totalReward);
         (bool ok, ) = payable(msg.sender).call{value: totalReward}("");
@@ -275,50 +279,94 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
     function cancelRound(uint256 roundId) public onlyOwnerOrOperator nonReentrant {
         Round storage round = rounds[roundId];
 
-        require(!round.rewardCalculated && !round.cancelled, "Round finished");
+        require((!round.rewardsCalculated) && (!round.roundCancelled), "Round finished");
         require(block.timestamp > round.closeTimestamp + MAX_BUFFER_SECONDS, "Buffer time not passed");
 
-        round.cancelled = true;
+        round.roundCancelled = true;
+
         emit RoundCancelled(roundId, "Timeout");
 
         _refundPlayersInRound(roundId);
+
+        if (roundId == currentRoundId) {
+            _resetGameState();
+        }
+        else if (roundId == currentRoundId - 1) {
+            round.closeTimestamp = block.timestamp;
+            round.rewardsCalculated = true;
+        }
     }
-    
+
+    function _resetGameState() internal {
+        currentRoundId = currentRoundId + 1;
+
+        if (genesisStarted == 0) {
+            genesisStarted = 1;
+        }
+        if (genesisLocked == 0 && currentRoundId > 1) {
+            genesisLocked = 1;
+        }
+
+        _startRound(currentRoundId);
+
+        if (currentRoundId > 1) {
+            Round storage prevRound = rounds[currentRoundId - 1];
+            prevRound.closeTimestamp = block.timestamp;
+            prevRound.lockTimestamp = block.timestamp - SETTLE_DURATION;
+            prevRound.startTimestamp = prevRound.lockTimestamp - LOCK_DURATION;
+        }
+    }
+        
     function _refundPlayersInRound(uint256 roundId) internal {
         Round storage round = rounds[roundId];
-        require(round.cancelled, "Round not cancelled");
+        require(round.roundCancelled, "Round not cancelled");
         address[] memory players = usersInRound[roundId];
 
-        for (uint8 i = 0; i < players.length; i++) {
+        for (uint256 i = 0; i < players.length;) {
             address player = players[i];
-            uint256 refundAmount = userBetsInRound[roundId][player].amount;
-            uint256 userStake = userClaimableAmount[player];
-            userClaimableAmount[player] = userStake + refundAmount;
-            emit PlayerRefunded(player, roundId, refundAmount);
+            BetInfo storage bet = userBetsInRound[roundId][player];
+            uint256 refundAmount = bet.pumpAmount + bet.dumpAmount;
+            
+            if (refundAmount > 0 && !bet.claimed) {
+                userClaimableAmount[player] += refundAmount;
+                userClaimableRounds[player][roundId] = refundAmount;
+                emit PlayerRefunded(player, roundId, refundAmount);
+            }
+            unchecked {i++;}
         }
     }
 
     function _calculateRewards(uint256 roundId) internal {
         require(rounds[roundId].oracleCalled, "Oracle not called");
-        require(!rounds[roundId].rewardCalculated, "Rewards already calculated");
+        require(!rounds[roundId].rewardsCalculated, "Rewards already calculated");
         
         Round storage round = rounds[roundId];
         address[] memory users = usersInRound[roundId];
         
         if (round.lockPrice == round.closePrice) {
             cancelRound(roundId);
+            emit RewardsCalculated(roundId, round.closePrice, 0, 0, 0, Position.None);
         } else {
             round.winner = round.closePrice > round.lockPrice ? Position.Pump : Position.Dump;
             
-            for (uint256 i = 0; i < users.length; i++) {
+            uint256 totalWinningAmount = round.winner == Position.Pump ? round.pumpAmount : round.dumpAmount;
+            uint256 totalLosingAmount = round.winner == Position.Pump ? round.dumpAmount : round.pumpAmount;
+            
+            for (uint256 i = 0; i < users.length;) {
                 address user = users[i];
                 BetInfo storage bet = userBetsInRound[roundId][user];
-                if (bet.amount > 0 && !bet.claimed && bet.position == round.winner) {
-                    uint256 reward = calculatePotentialPayout(bet.amount);
-                    userClaimableAmount[user] += reward;
-                    round.totalPayout += reward;
-                    bet.claimed = true;
+                
+                if (!bet.claimed) {
+                    uint256 winAmount = round.winner == Position.Pump ? bet.pumpAmount : bet.dumpAmount;
+                    if (winAmount > 0) {
+                        uint256 reward = (winAmount * (totalLosingAmount * PAYOUT_MULTIPLIER / PAYOUT_DIVISOR)) / totalWinningAmount;
+                        reward += winAmount;
+                        userClaimableAmount[user] += reward;
+                        userClaimableRounds[user][roundId] = reward;
+                        round.totalPayout += reward;
+                    }
                 }
+                unchecked {i++;}
             }
             
             emit RewardsCalculated(
@@ -331,7 +379,7 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
             );
         }
         
-        round.rewardCalculated = true;
+        round.rewardsCalculated = true;
     }
 
     function withdraw(uint256 amount) external onlyOwner nonReentrant {
@@ -388,6 +436,22 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         emit MaxBetUpdated(_maxBetAmount);
     }
 
+    function getUserClaimableAmount(address user) external view returns (uint256) {
+        return userClaimableAmount[user];
+    }
+
+    function getUserRounds(address user) external view returns (uint256[] memory) {
+        return userRounds[user];
+    }
+
+    function getUsersInRound(uint256 roundId) external view returns (address[] memory) {
+        return usersInRound[roundId];
+    }
+
+    function isRoundClaimable(address user, uint256 roundId) external view returns (bool) {
+        return userClaimableRounds[user][roundId] > 0;
+    }
+
     function pause() external onlyOwner {
         _pause();
     }
@@ -419,10 +483,10 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
             round.pumpAmount,
             round.dumpAmount,
             round.oracleCalled,
-            round.rewardCalculated
+            round.rewardsCalculated
         );
     }
 
     receive() external payable onlyOwnerOrOperator {}
-    fallback() external payable {}
+    fallback() external payable onlyOwnerOrOperator {}
 }
