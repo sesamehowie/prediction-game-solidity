@@ -140,7 +140,10 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         
         _safeLockRound(currentRoundId, price);
         _safeEndRound(currentRoundId - 1, price);
-        _calculateRewards(currentRoundId - 1);
+        
+        if (!rounds[currentRoundId - 1].roundCancelled && !rounds[currentRoundId - 1].rewardsCalculated) {
+            _calculateRewards(currentRoundId - 1);
+        }
         
         currentRoundId = currentRoundId + 1;
         _safeStartRound(currentRoundId);
@@ -276,10 +279,18 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         require(ok, "Transfer Fail");
     }
 
-    function cancelRound(uint256 roundId) public onlyOwnerOrOperator nonReentrant {
+
+    function cancelRound(uint256 roundId, bytes[] calldata pythPriceUpdate) public payable onlyOwnerOrOperator nonReentrant {
+        uint256 price = updateAndGetPrice(pythPriceUpdate);
+        currentPrice = price;
+
+        _cancelRoundInternal(roundId, price);
+    }
+
+    function _cancelRoundInternal(uint256 roundId, uint256 price) internal {
         Round storage round = rounds[roundId];
 
-        require((!round.rewardsCalculated) && (!round.roundCancelled), "Round finished");
+        require(!round.rewardsCalculated && !round.roundCancelled, "Round finished");
         require(block.timestamp > round.closeTimestamp + MAX_BUFFER_SECONDS, "Buffer time not passed");
 
         round.roundCancelled = true;
@@ -289,15 +300,23 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         _refundPlayersInRound(roundId);
 
         if (roundId == currentRoundId) {
-            _resetGameState();
-        }
-        else if (roundId == currentRoundId - 1) {
+            _resetGameState(price);
+        } else if (roundId == currentRoundId - 1) {
             round.closeTimestamp = block.timestamp;
             round.rewardsCalculated = true;
+
+            Round storage currentRound = rounds[currentRoundId];
+
+            if (currentRound.startTimestamp != 0 && !currentRound.oracleCalled) {
+                currentRound.startTimestamp = block.timestamp;
+                currentRound.lockTimestamp = block.timestamp + BET_DURATION;
+                currentRound.closeTimestamp = block.timestamp + BET_DURATION + LOCK_DURATION + SETTLE_DURATION;
+                emit StartRound(currentRoundId);
+            }
         }
     }
 
-    function _resetGameState() internal {
+    function _resetGameState(uint256 price) internal {
         currentRoundId = currentRoundId + 1;
 
         if (genesisStarted == 0) {
@@ -311,9 +330,18 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
 
         if (currentRoundId > 1) {
             Round storage prevRound = rounds[currentRoundId - 1];
-            prevRound.closeTimestamp = block.timestamp;
-            prevRound.lockTimestamp = block.timestamp - SETTLE_DURATION;
-            prevRound.startTimestamp = prevRound.lockTimestamp - LOCK_DURATION;
+            if (!prevRound.rewardsCalculated) {
+                prevRound.closeTimestamp = block.timestamp;
+                prevRound.lockTimestamp = block.timestamp - SETTLE_DURATION;
+                prevRound.startTimestamp = prevRound.lockTimestamp - LOCK_DURATION;
+                if (prevRound.roundCancelled) {
+                    prevRound.rewardsCalculated = true;
+                } else {
+                    prevRound.lockPrice = price;
+                    prevRound.closePrice = price;
+                    prevRound.oracleCalled = true;
+                }
+            }
         }
     }
         
@@ -337,14 +365,22 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
     }
 
     function _calculateRewards(uint256 roundId) internal {
-        require(rounds[roundId].oracleCalled, "Oracle not called");
         require(!rounds[roundId].rewardsCalculated, "Rewards already calculated");
-        
+
         Round storage round = rounds[roundId];
+
+        if (round.roundCancelled) {
+            round.rewardsCalculated = true;
+            emit RewardsCalculated(roundId, 0, 0, 0, 0, Position.None);
+            return;
+        }
+
+        require(round.oracleCalled, "Oracle not called");
+        
         address[] memory users = usersInRound[roundId];
         
         if (round.lockPrice == round.closePrice) {
-            cancelRound(roundId);
+            _cancelRoundInternal(roundId, round.closePrice);
             emit RewardsCalculated(roundId, round.closePrice, 0, 0, 0, Position.None);
         } else {
             round.winner = round.closePrice > round.lockPrice ? Position.Pump : Position.Dump;
