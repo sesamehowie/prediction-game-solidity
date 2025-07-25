@@ -161,17 +161,18 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
         require(rounds[roundId].startTimestamp != 0, "Can only lock round after round has started");
         require(block.timestamp >= rounds[roundId].lockTimestamp, "Can only lock round after lockTimestamp");
         require(
-            block.timestamp <= rounds[roundId].lockTimestamp + MAX_BUFFER_SECONDS,
-            "Can only lock round within bufferSeconds"
+            block.timestamp <= rounds[roundId].lockTimestamp + MAX_BUFFER_SECONDS + ROUND_STAGE_DURATION,
+            "Can only lock round within extended buffer"
         );
-        
+
         Round storage round = rounds[roundId];
-        round.closeTimestamp = block.timestamp + (ROUND_STAGE_DURATION);
+        round.closeTimestamp = block.timestamp + ROUND_STAGE_DURATION;
         round.lockPrice = price;
         round.oracleCalled = true;
-        
+
         emit LockRound(roundId, round.lockPrice, round.betVolume);
     }
+
 
     function _safeEndRound(uint256 roundId, uint256 price) internal {
         require(rounds[roundId].lockTimestamp != 0, "Can only end round after round has locked");
@@ -325,21 +326,24 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
             genesisLocked = 1;
         }
 
-        _startRound(currentRoundId);
+        Round storage newRound = rounds[currentRoundId];
+        newRound.roundId = currentRoundId;
+        newRound.startTimestamp = block.timestamp;
+        newRound.lockTimestamp = block.timestamp + ROUND_STAGE_DURATION;
+        newRound.closeTimestamp = block.timestamp + (ROUND_STAGE_DURATION * 2);
+
+        emit StartRound(currentRoundId);
 
         if (currentRoundId > 1) {
             Round storage prevRound = rounds[currentRoundId - 1];
-            if (!prevRound.rewardsCalculated) {
+            if (!prevRound.rewardsCalculated && !prevRound.roundCancelled) {
                 prevRound.closeTimestamp = block.timestamp;
                 prevRound.lockTimestamp = block.timestamp - ROUND_STAGE_DURATION;
                 prevRound.startTimestamp = block.timestamp - (ROUND_STAGE_DURATION * 2);
-                if (prevRound.roundCancelled) {
-                    prevRound.rewardsCalculated = true;
-                } else {
-                    prevRound.lockPrice = price;
-                    prevRound.closePrice = price;
-                    prevRound.oracleCalled = true;
-                }
+                prevRound.lockPrice = price;
+                prevRound.closePrice = price;
+                prevRound.oracleCalled = true;
+                prevRound.rewardsCalculated = true;
             }
         }
     }
@@ -383,9 +387,6 @@ contract PredictionGame is Ownable, ReentrancyGuard, Pausable {
             emit RewardsCalculated(roundId, round.closePrice, 0, 0, 0, Position.None);
         } else {
             round.winner = round.closePrice > round.lockPrice ? Position.Pump : Position.Dump;
-            
-            uint256 totalWinningAmount = round.winner == Position.Pump ? round.pumpAmount : round.dumpAmount;
-            uint256 totalLosingAmount = round.winner == Position.Pump ? round.dumpAmount : round.pumpAmount;
             
             for (uint256 i = 0; i < users.length;) {
                 address user = users[i];
